@@ -1,11 +1,13 @@
 cmake_minimum_required(VERSION 3.12)
 project(ptldap_tests)
 
-set(CMAKE_CXX_STANDARD 17)
+add_library(ptldap INTERFACE)
+target_include_directories(ptldap INTERFACE ..)
+target_compile_features(ptldap INTERFACE cxx_std_20)
+target_compile_options(ptldap INTERFACE -fconcepts)
 
-include_directories(../)
+add_executable(tests ber.cpp ldap.cpp test_main.cpp catch.hpp)
+target_link_libraries(tests ptldap)
 
-add_executable(ptldap_tests
-        test_main.cpp
-        all_tests.cpp
-)
+enable_testing()
+add_test(tests tests)

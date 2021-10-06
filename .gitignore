@@ -1,9 +1,5 @@
-server.h
-login.h
+/config.h
+/build
+
 .editorconfig
-
 .vscode/
-
-dojo/BindRequest/main
-
-dojo/BindRequest/main.o

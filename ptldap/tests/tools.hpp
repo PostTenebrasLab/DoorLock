@@ -9,7 +9,10 @@
 #ifndef PTLDAP_TESTS_TOOLS_H
 #define PTLDAP_TESTS_TOOLS_H
 
+#include "catch.hpp"
+
 #include <iomanip>
+#include <limits>
 
 template <typename T>
 struct Hex
@@ -47,6 +50,25 @@ template <typename T>
 inline std::ostream& operator << (std::ostream& stream, const Hex<T>& value) {
     value.write(stream);
     return stream;
+}
+
+void check_bytes(auto&& left, auto&& right) {
+    CHECK(left == right);
+    if (left == right) {
+        return;
+    }
+
+    for (auto i = 0; i < left.size(); ++i) {
+        printf("\\x%02x", left[i] & 0xff);
+    }
+    printf("\n");
+
+    for (auto i = 0; i < right.size(); ++i) {
+        printf("\\x%02x", right[i] & 0xff);
+    }
+    printf("\n");
+
+    printf("\n");
 }
 
 #endif //PTLDAP_TESTS_TOOLS_H

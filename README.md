@@ -15,6 +15,6 @@ Click on the `Upload` button and you're done!
 Install libraries, compile and upload:
 
     arduino-cli lib install MFRC522
-    arduino-cli compile --fqbn esp8266:esp8266:d1_mini
-    arduino-cli upload -p /dev/ttyUSB0 --fqbn esp8266:esp8266:d1_mini
-
+    arduino-cli lib install FastLED
+    arduino-cli compile --fqbn esp8266:esp8266:d1_mini --build-property compiler.cpp.extra_flags=-fexceptions --build-property build.stdcpp_lib=-lstdc++-exc
+    arduino-cli upload --port /dev/ttyUSB0 --fqbn esp8266:esp8266:d1_mini
