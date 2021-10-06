@@ -1,5 +1,5 @@
-server.h
-login.h
+config.h
 .editorconfig
 
 .vscode/
+/build

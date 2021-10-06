@@ -1,20 +1,13 @@
 cmake_minimum_required(VERSION 3.12)
 project(ptldap_tests)
 
-set(CMAKE_CXX_STANDARD 17)
+add_library(ptldap INTERFACE)
+target_include_directories(ptldap INTERFACE ..)
+target_compile_features(ptldap INTERFACE cxx_std_20)
+target_compile_options(ptldap INTERFACE -fconcepts)
 
-include_directories(../)
+add_executable(tests ber.cpp ldap.cpp test_main.cpp catch.hpp)
+target_link_libraries(tests ptldap)
 
-file(GLOB LIB_SRC_FILES "ber.cpp")
-set_property(SOURCE ${LIB_SRC_FILES} PROPERTY COMPILE_FLAGS -std=c++17)
-SET(CMAKE_CXX_FLAGS  "${CMAKE_CXX_FLAGS} -fno-exceptions")
-
-add_executable(ber_tests
-    test_main.cpp
-    ${LIB_SRC_FILES}
-)
-
-add_executable(ldap_tests
-        test_main.cpp
-        ldap.cpp
-)
+enable_testing()
+add_test(tests tests)

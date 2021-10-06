@@ -1,660 +1,643 @@
-// For more inspiration, see https://github.com/wireshark/wireshark/blob/master/epan/dissectors/packet-ldap.c
-// and http://luca.ntop.org/Teaching/Appunti/asn1.html
-// and https://ldap.com/ldapv3-wire-protocol-reference-asn1-ber/
+// ISO/IEC 8825-1:2015
+// ASN.1 encoding rules: Specification of Basic Encoding Rules (BER),
+// Canonical Encoding Rules (CER) and Distinguished Encoding Rules (DER)
+// https://www.iso.org/standard/68345.html
+// https://standards.iso.org/ittf/PubliclyAvailableStandards/c068345_ISO_IEC_8825-1_2015.zip
 
-#include <string>
-#include <type_traits>
-#include <utility>
-#include <vector>
-#include <sstream>
-#include <memory>
-#include <iostream>
-#include <cstring>
-#include <optional>
+// Wireshark implementation
+// https://github.com/wireshark/wireshark/blob/master/epan/dissectors/packet-ldap.c
 
-namespace BER
-{
-    #include "string_view.hpp"
+// A Layman's Guide to a Subset of ASN.1, BER, and DER
+// http://luca.ntop.org/Teaching/Appunti/asn1.html
 
-    using namespace nonstd::literals;
-    using namespace nonstd;
+// LDAPv3 Wire Protocol Reference: The ASN.1 Basic Encoding Rules
+// https://ldap.com/ldapv3-wire-protocol-reference-asn1-ber/
 
+#include "bytes.hpp"
+#include <tuple>
+#include <variant>
 
-    using namespace std;
+namespace BER {
 
-    /// conversion: unique_ptr<FROM>->FROM*->TO*->unique_ptr<TO>
-    template<typename TO, typename FROM>
-    static unique_ptr<TO> static_unique_pointer_cast (unique_ptr<FROM>&& old){
-        return unique_ptr<TO>{static_cast<TO*>(old.release())};
+    constexpr auto to_int(auto value) {
+        using T = decltype(value);
+        if constexpr (std::is_enum_v<T>) {
+            return std::underlying_type_t<T>(value);
+        } else {
+            return value;
+        }
     }
 
-
-    enum class Type : uint8_t
-    {
-        // Base types
-        Bool = 0x01,
-        Integer = 0x02,
-        String = 0x04,
-        Enum = 0x0a,
-
-        Attribute = 0x30,
-
-        // Authentications
-        SimpleAuth = 0x80,
-        SASL,
-
-        // Filters
-        And = 0xA0,
-        Or,
-        Not,
-        EqualityMatch,
-        Substrings,
-        GreaterOrEqual,
-        LessOrEqual,
-        Present,
-        ApproxMatch,
-        ExtensibleMatch,
+    enum class TagClass {
+        Universal = 0b00,
+        Application = 0b01,
+        ContextSpecific = 0b10,
+        Private = 0b11,
     };
 
-    enum class MatchingRuleAssertion
-    {
-        MatchingRule = 0x81,
-        Type,
-        MatchValue,
-        DnAttributes,
+    enum class Encoding {
+        Primitive = 0b0,
+        Constructed = 0b1,
     };
 
-    static const uint8_t HeaderTagMinSize = 1;
-    static const uint8_t HeaderLengthMinSize = 1;
+    template<typename T>
+    uint8_t count_bits(T value) {
+        if (value < 0) value = ~value;
 
-    static const uint8_t HeaderTypeNumberNBits   = 5;
-    static const uint8_t HeaderTypeEncodingNBits = 1;
-    static const uint8_t HeaderTypeClassNBits    = 2;
-
-    static const uint8_t HeaderTypeTagShift      = 0;
-    static const uint8_t HeaderTypeEncodingShift = HeaderTypeTagShift + HeaderTypeNumberNBits;
-    static const uint8_t HeaderTypeClassShift    = HeaderTypeEncodingShift + HeaderTypeEncodingNBits;
-
-    static const uint8_t HeaderTypeNumberLongShift = 7;
-    static const uint8_t HeaderTypeNumberLongMask  = (1 << HeaderTypeNumberLongShift);
-
-    enum HeaderTagNumber {
-        Boolean = 0x01,
-        Integer = 0x02,
-        BitString = 0x03,
-        OctetString = 0x04,
-        Null = 0x05,
-        ObjectIdentifier = 0x06,
-        Sequence = 0x10,
-        SequenceOf = 0x10,
-        Set = 0x11,
-        SetOf = 0x11,
-        PrintableString = 0x13,
-        T61String = 0x14,
-        IA5String = 0x16,
-        UTCTime = 0x17,
-        ExtendedType = 0x1F,
-    };
-
-    enum HeaderTagType {
-        Primitive,
-        Constructed,
-    };
-
-    enum HeaderTagClass {
-        Universal,
-        Application,
-        ContextSpecific,
-        Private,
-    };
-
-
-    struct __attribute__ ((packed)) HeaderTag {
-    public:
-        HeaderTagNumber number: HeaderTypeNumberNBits;
-        bool is_constructed: HeaderTypeEncodingNBits;
-        HeaderTagClass asn1_class: HeaderTypeClassNBits;
-        uint8_t extra_tag_number[];
-    public:
-
-        static constexpr HeaderTag* parse(const string_view raw) {
-            return static_cast<BER::HeaderTag*>((void*)raw.data());
+        auto bits = uint8_t{0};
+        while (value) {
+            ++bits;
+            value >>= 1;
         }
+        return bits;
+    }
 
-        // TODO: check for bound for extended type?
-        uint8_t get_size() const {
-            uint8_t size = 0;
-            // Check for high-tag-number form
-            if(number == HeaderTagNumber::ExtendedType) {
-                // Add 1 byte for every intermediate tag number
-                while((uint8_t)this->get_data_ptr()[size] & HeaderTypeNumberLongMask) {
-                    size += 1;
+    template<typename N>
+    struct DynamicIdentifier {
+
+        using TagNumber = N;
+        static constexpr auto extended_type = 0x1F;
+
+        Encoding encoding;
+        TagClass tag_class;
+        TagNumber tag_number;
+
+        explicit constexpr DynamicIdentifier(Encoding encoding, TagClass tag_class, TagNumber tag_number):
+            encoding(FWD(encoding)),
+            tag_class(FWD(tag_class)),
+            tag_number(FWD(tag_number)) {}
+
+        void write(auto& writer) const {
+            auto tag_class = to_int(this->tag_class);
+            auto encoding = to_int(this->encoding);
+            auto tag_number = to_int(this->tag_number);
+
+            auto write0 = [&](auto tag_number) {
+                writer.write((tag_class << 6) | (encoding << 5) | (tag_number << 0));
+            };
+            if (tag_number < extended_type) {
+                write0(tag_number);
+            } else {
+                write0(extended_type);
+                auto shifts = (count_bits(tag_number) - 1) / 7;
+                for (auto shift = shifts * 7; shift; shift -= 7) {
+                    writer.write(0b10000000 | (tag_number >> shift) & 0b01111111);
                 }
-                // Add final byte
-                size += 1;
+                writer.write(0b00000000 | (tag_number & 0b01111111));
             }
-            // Minimal size of the tag
-            size += 1;
-            return size;
         }
 
-        constexpr char* buf_extra_tag_number() const {
-            return static_cast<char*>((void*)&this->extra_tag_number);
+        static std::optional<DynamicIdentifier> read(auto& reader) {
+            auto byte = OPT_TRY(reader.read());
+            auto tag_class = TagClass((byte & 0b11000000) >> 6);
+            auto encoding = Encoding((byte & 0b00100000) >> 5);
+            auto tag_number = TagNumber((byte & 0b00011111) >> 0);
+
+            if (tag_number == TagNumber(extended_type)) {
+                auto tag_number_int = to_int(TagNumber(0));
+                do {
+                    byte = OPT_TRY(reader.read());
+                    tag_number_int = (tag_number_int << 7) | ((byte & 0b01111111) >> 0);
+                } while ((byte & 0b10000000) >> 7);
+                tag_number = TagNumber(std::move(tag_number_int));
+            }
+
+            return DynamicIdentifier(encoding, tag_class, std::move(tag_number));
         }
 
-        template<typename T = uint8_t>
-        constexpr T* get_data_ptr() const {
-            return static_cast<T*>((void*)&this->extra_tag_number);
-        }
-
-        inline string_view get_string_view() const {
-            return string_view(static_cast<const char *>((void*)this));
-        }
     };
 
-    struct __attribute__ ((packed)) HeaderLength {
-        uint8_t length: 7;
-        uint8_t is_long: 1;
-        uint8_t extra_length[];
-    public:
+    template<Encoding encoding, TagClass tag_class, auto tag_number>
+    struct StaticIdentifier {
 
-        static constexpr HeaderLength* parse(const string_view raw) {
-            return static_cast<BER::HeaderLength*>((void*)raw.data());
+        constexpr static DynamicIdentifier dynamic{encoding, tag_class, tag_number};
+        using Dynamic = decltype(dynamic);
+
+        template<TagClass tag_class_new, auto tag_number_new>
+        constexpr auto tagged() const {
+            return StaticIdentifier<encoding, tag_class_new, tag_number_new>{};
         }
 
-        uint8_t length_at(const uint8_t offset) {
-            if(offset > length) {
-                return 0;
-            }
-            return (uint8_t) this->get_data_ptr()[offset];
+        void write(auto& writer) const {
+            dynamic.write(writer);
         }
 
-        constexpr uint8_t get_size() const {
-            return (!this->is_long) ? 1 : 1 + this->length;
+        static std::optional<StaticIdentifier> read(auto& reader) {
+            constexpr auto expected = StaticIdentifier{};
+            auto actual = OPT_TRY(Dynamic::read(reader));
+            OPT_REQUIRE(expected == actual);
+            return expected;
         }
 
-        template<typename T = uint8_t>
-        constexpr T* get_data_ptr() const {
-            return static_cast<T*>((void*)&this->extra_length);
-        }
-
-        constexpr string_view get_string_view() const {
-            return string_view(static_cast<const char *>((void*)this));
-        }
-
-        bool is_data_size_usable() const {
-            // Directly return true for short form
-            if (!this->is_long) return true;
-
-            // Check if the long-form size can be stored in size_t, because we are cowards
-            // If there is more bytes of length than what we can store in a size_t, check if there are empty
-            if(this->length > sizeof(size_t)) {
-                for(int i = 0; i < this->length - sizeof(size_t); i++) {
-                    if (this->extra_length[this->length-i-1] > 0)
-                        return false;
-                }
-            }
+        bool operator==(StaticIdentifier const& that) const {
             return true;
         }
-
-        size_t get_data_size() const {
-            // Directly return the size for short form
-            if (!this->is_long)
-                return this->length;
-
-            // Compute the size only on the last bytes
-            size_t usable_size = 0;
-            for(uint8_t i = this->length - sizeof(size_t); i < this->length; i++) {
-                usable_size += this->extra_length[i] << (8 * i);
-            }
-            return usable_size;
-        }
-    };
-
-    enum ParseType {
-        None,
-        Unchecked,
-        Checked,
-    };
-
-    enum ElemStateType {
-        Empty,
-        ParsedInvalid,
-        ParsedMaybeInvalid,
-        Valid,
-    };
-
-    struct Element {
-        string_view data;
-
-        HeaderTag* tag = nullptr;
-        HeaderLength* length = nullptr;
-        string_view extra_data = {};
-
-        unique_ptr<string> storage = nullptr;
-
-        ElemStateType state = ElemStateType::Empty;
-
-    public:
-        // Parse element
-        explicit Element(const string_view raw, ParseType parse = ParseType::Unchecked) : data(raw) {
-            switch (parse) {
-                case ParseType::Unchecked:
-                    this->internal_parse_unchecked();
-                    break;
-                case ParseType::Checked:
-                    this->internal_parse();
-                    break;
-                default:
-                    break;
-            }
+        bool operator==(Dynamic const& that) const {
+            return encoding == that.encoding && tag_class == that.tag_class && tag_number == that.tag_number;
         }
 
-        // Simple element build
-        explicit Element(HeaderTagNumber number, HeaderTagClass asn1_class, size_t length, bool is_constructed = false) {
-            size_t element_size = HeaderTagMinSize + HeaderLengthMinSize + length;
-            size_t length_size = 0;
-            if(length > (1 << HeaderTypeNumberLongShift) - 1) {
-                length_size = log2(length) / 8;
-                element_size += length_size;
+    };
+
+    struct Length {
+
+        enum class Form {
+            Short = 0b0,
+            Long = 0b1,
+        };
+
+        static constexpr uint8_t Indefinite = 0b0000000;
+
+        std::optional<size_t> length;
+        explicit Length(std::optional<size_t>&& length): length(FWD(length)) {}
+
+        bool is_indefinite() const {
+            return !length.has_value();
+        }
+
+        void write(auto& bytes) const {
+            auto write_length = [&](Form form, uint8_t length) {
+                bytes.write((to_int(form) << 7) | (length << 0));
+            };
+
+            if (is_indefinite()) {
+                write_length(Form::Long, Indefinite);
+                return;
             }
-            this->storage = make_unique<string>(element_size, '\0');
-            this->data = *this->storage;
 
-            size_t offset = 0;
-            this->tag = (HeaderTag *) &this->data[offset];
-            this->tag->number = number;
-            this->tag->is_constructed = is_constructed;
-            this->tag->asn1_class = asn1_class;
+            auto count = *length;
+            if (count <= 0b01111111) {
+                write_length(Form::Short, count);
+                return;
+            }
 
-            offset += HeaderTagMinSize;
-            this->length = (HeaderLength *) &this->data[offset];
-            if (length > (1 << HeaderTypeNumberLongShift) - 1) {
-                this->length->is_long = true;
-                this->length->length = length_size;
-                for(size_t i = length_size - 1; i < length_size; i++) {
-                    ((uint8_t*)&this->length->extra_length)[i] = (length_size >> (8*(length_size-i-1))) & 0xff;
-                }
-                offset += length_size;
+            auto shifts = (count_bits(count) - 1) / 8;
+            auto length_length = shifts + 1;
+            write_length(Form::Long, length_length);
+            for (auto shift = shifts * 8; shift; shift -= 8) {
+                bytes.write((count >> shift) & 0b11111111);
+            }
+            bytes.write(count & 0b11111111);
+        }
+
+        static std::optional<Length> read(auto& reader) {
+            auto byte = OPT_TRY(reader.read());
+
+            auto form = Form((byte & 0b10000000) >> 7);
+            if (form == Form::Short) {
+                return Length(byte);
+            }
+
+            auto count = (byte & 0b01111111) >> 0;
+            if (count == Indefinite) {
+                return Length(std::nullopt);
+            }
+            OPT_REQUIRE(count <= sizeof(size_t));
+
+            auto length = size_t{0};
+            for (auto i = 0u; i < count; ++i) {
+                byte = OPT_TRY(reader.read());
+                length = (length << 8) | byte;
+            }
+            OPT_REQUIRE(length != SIZE_MAX);
+            return Length(length);
+        }
+
+    };
+
+    template<typename Type, typename Value>
+    struct Writable {
+
+        Type type;
+        Value value;
+
+        explicit constexpr Writable(Type type, Value value):
+            type(FWD(type)),
+            value(FWD(value)) {}
+
+        void write(auto& writer) const {
+            type.write(writer, value);
+        }
+
+    };
+
+    template<typename I, typename S>
+    struct Type {
+
+        using Identifier = I;
+        using Serde = S;
+
+        Identifier identifier;
+        Serde serde;
+
+        explicit constexpr Type(Identifier identifier, Serde serde):
+            identifier(FWD(identifier)),
+            serde(FWD(serde)) {}
+
+        template<TagClass tag_class, auto tag_number>
+        constexpr auto tagged() const {
+            return BER::Type(identifier.template tagged<tag_class, tag_number>(), serde);
+        }
+
+        template<auto tag_number>
+        constexpr auto context_specific() const {
+            return tagged<TagClass::ContextSpecific, tag_number>();
+        }
+
+        template<auto tag_number>
+        constexpr auto application() const {
+            return tagged<TagClass::Application, tag_number>();
+        }
+
+        template<typename Value>
+        constexpr auto operator()(const Writable<Type, Value>& writable) const {
+            return writable;
+        }
+        constexpr auto operator()(auto&&... args) const {
+            return Writable(*this, serde(FWD(args)...));
+        }
+
+        void write(auto& writer, auto& value) const {
+            identifier.write(writer);
+
+            auto counter = Bytes::CounterWriter();
+            serde.write(counter, value);
+            Length(counter.count).write(writer);
+
+            serde.write(writer, value);
+        }
+
+        auto read(auto& reader) const -> decltype(serde.read(std::declval<Bytes::StringViewReader&>())) {
+            auto identifier = OPT_TRY(Identifier::read(reader));
+            OPT_REQUIRE(this->identifier == identifier);
+
+            auto length = OPT_TRY(Length::read(reader));
+            OPT_REQUIRE(!length.is_indefinite());
+
+            auto bytes = Bytes::StringViewReader{OPT_TRY(reader.read(*length.length))};
+            auto value = OPT_TRY(serde.read(bytes));
+            OPT_REQUIRE(bytes.empty());
+            return value;
+        }
+
+    };
+    template<Encoding encoding, auto tag_number>
+    constexpr auto type(auto&& serde) {
+        return Type(StaticIdentifier<encoding, TagClass::Universal, tag_number>{}, FWD(serde));
+    }
+
+    template<typename Type>
+    struct Explicit {
+
+        Type type;
+        explicit constexpr Explicit(auto&& type):
+            type(FWD(type)) {}
+
+        auto operator()(auto&& value) const {
+            return FWD(value);
+        }
+
+        void write(auto& writer, auto& value) const {
+            type.write(writer, value);
+        }
+
+        auto read(auto& reader) const -> decltype(type.read(reader)) {
+            return type.read(reader);
+        }
+
+    };
+    constexpr auto explicit_(auto&& type) {
+        return BER::type<Encoding::Constructed, 0x00>(Explicit<std::decay_t<decltype(type)>>(FWD(type)));
+    }
+
+    struct Boolean {
+
+        auto operator()(bool value) const {
+            return value;
+        }
+
+        void write(auto& writer, bool value) const {
+            writer.write(value ? 0xff : 0x00);
+        }
+
+        std::optional<bool> read(auto& reader) const {
+            return OPT_TRY(reader.read()) != 0x00;
+        }
+
+    };
+    constexpr auto boolean = type<Encoding::Primitive, 0x01>(Boolean());
+
+    template<typename Integral = int> // TODO
+    struct Integer {
+
+        Integral operator()(auto&& value) const {
+            return FWD(value);
+        }
+
+        void write(auto& writer, auto const& value) const {
+            auto shifts = count_bits(value) / 8;
+            for (auto shift = shifts * 8; shift; shift -= 8) {
+                writer.write((value >> shift) & 0b11111111);
+            }
+            writer.write(value & 0b11111111);
+        }
+
+        std::optional<Integral> read(auto& reader) const {
+            auto length = reader.size();
+            auto first = int8_t(OPT_TRY(reader.read()));
+
+            if (std::is_unsigned_v<Integral> && first == 0) {
+                OPT_REQUIRE(length - 1 <= sizeof(Integral));
             } else {
-                this->length->length = length;
-                offset += HeaderLengthMinSize;
+                OPT_REQUIRE(length <= sizeof(Integral));
             }
 
-            this->extra_data = &this->data[offset];
+            auto value = Integral(first);
+            for (auto shifts = length - 1; shifts; --shifts) {
+                auto byte = OPT_TRY(reader.read());
+                value <<= 8;
+                value |= byte;
+            }
+            return value;
         }
 
-    protected:
-        Element* internal_parse_unchecked() {
-            this->tag = HeaderTag::parse(this->data);
-            auto tag_size = this->tag->get_size();
-            this->length = HeaderLength::parse(&this->tag->get_string_view().data()[tag_size]);
-            auto length_size = this->length->get_size();
-            // Do not point to invalid data if the packet is not supposed to contain any
-            if (this->length->length > 0)
-                this->extra_data = &this->length->get_string_view().data()[length_size];
-            this->state = ElemStateType::ParsedMaybeInvalid;
-            return this;
+    };
+    constexpr auto integer = type<Encoding::Primitive, 2>(Integer());
+
+    struct OctetString {
+
+        auto operator()(auto&& value) const {
+            return FWD(value);
         }
 
-        Element* internal_parse() {
-            auto cur_offset = 0;
-            size_t data_size = 0;
+        void write(auto& writer, auto const& value) const {
+            writer.write(value);
+        }
 
-            // Parse the tag
-            this->tag = HeaderTag::parse(this->data);
-            // Add the length of the tag to the parsed data offset
-            cur_offset += this->tag->get_size();
-            // Check if the raw data can fit the full tag and the minimum header length size
-            if (this->data.size() < cur_offset + HeaderLengthMinSize) goto cleanup;
+        std::optional<std::string_view> read(auto& reader) const {
+            return OPT_TRY(reader.read(reader.size()));
+        }
 
-            // Parse the length
-            this->length = HeaderLength::parse(&this->tag->get_string_view().data()[this->tag->get_size()]);
-            // Add the length of the tag to the parsed data offset
-            cur_offset += this->length->get_size();
-            // Check if the raw data can fit the whole header length size
-            if (this->data.size() < cur_offset) goto cleanup;
-            // Check if we can fit the data length into a size_t to work on it after, because we are cowards and don't like BigInt
-            if (!this->length->is_data_size_usable()) goto cleanup;
-            // Get the data size
-            data_size = this->length->get_data_size();
-            if (data_size == 0) return this;
-            // Check if we can fit the data in the raw data, omit parsed data here to avoid overflow
-            if (this->data.size() < data_size) goto cleanup;
+    };
+    constexpr auto octet_string = type<Encoding::Primitive, 4>(OctetString());
 
-            // Save pointer to extra data if any
-            this->extra_data = &this->length->get_string_view().data()[this->length->get_size()];
+    struct Null {
 
-            this->state = ElemStateType::Valid;
+        constexpr auto operator()(nullptr_t value = nullptr) const {
+            return value;
+        }
 
-            return this;
+        void write(auto& writer, auto const& value) const {
+            // nothing to write
+        }
 
-            cleanup:
-            this->state = ElemStateType::ParsedInvalid;
+        std::optional<std::nullptr_t> read(auto& reader) const {
             return nullptr;
         }
 
-        ElemStateType check_state() {
-            if(this->tag == nullptr) return ElemStateType::Empty;
-            if(this->length == nullptr) return ElemStateType::Empty;
-
-            size_t cur_offset = 0;
-            auto data_size = this->data.size();
-            auto tag_size = this->tag->get_size();
-            auto length_size = this->tag->get_size();
-
-            // Add the length of the tag to the parsed data offset
-            cur_offset += tag_size;
-            // Check if the raw data can fit the full tag and the minimum header length size
-            if (this->data.size() < cur_offset + HeaderLengthMinSize) return ElemStateType::ParsedInvalid;
-
-            // Add the length of the tag to the parsed data offset
-            cur_offset += this->length->get_size();
-            // Check if the raw data can fit the whole header length size
-            if (this->data.size() < cur_offset) return ElemStateType::ParsedInvalid;
-            // Check if we can fit the data length into a size_t to work on it after, because we are cowards and don't like BigInt
-            if (!this->length->is_data_size_usable()) return ElemStateType::ParsedInvalid;
-            // Get the data size
-            size_t extra_data_size = this->length->get_data_size();
-            if (extra_data_size == 0) return ElemStateType::Valid;
-            cur_offset += extra_data_size;
-            // Check if we can fit the data in the raw data, omit parsed data here to avoid overflow
-            if (this->data.size() < cur_offset) return ElemStateType::ParsedInvalid;
-
-            return ElemStateType::Valid;
-        }
-
-    public:
-        static unique_ptr<Element> parse_unchecked(const string_view raw) {
-            return unique_ptr<Element>(new Element(raw, ParseType::Unchecked));
-        }
-
-        static unique_ptr<Element> parse(const string_view raw) {
-            // Manually parse so we can handle errors and return a nullptr instead
-            auto element = new Element(raw, ParseType::None);
-            return unique_ptr<Element>(element->internal_parse());
-        }
-
-        template<typename T>
-        constexpr T* get_data_ptr(const size_t offset = 0) const {
-            return static_cast<T*>((void *) &this->extra_data.data()[offset]);
-        }
-
-        const size_t get_size() const {
-            return this->tag->get_size() + this->length->get_size() + this->length->get_data_size();
-        }
-
-        template<typename T>
-        unique_ptr<T> try_as() {
-            return static_pointer_cast<T>(unique_ptr<Element>(this));
-        }
     };
+    constexpr auto null = type<Encoding::Primitive, 5>(Null());
 
-    // UniversalElement
-    template<HeaderTagNumber T> struct UniversalElement : Element {
-    public:
-        static constexpr HeaderTagNumber type = T;
+    template<typename Enum>
+    struct Enumerated {
+
+        using Integral = std::underlying_type_t<Enum>;
+        Integer<Integral> integer;
+
+        auto operator()(auto&& value) const {
+            return FWD(value);
+        }
+
+        void write(auto& writer, auto const& value) const {
+            integer.write(writer, Integral(value));
+        }
+
+        std::optional<Enum> read(auto& reader) const {
+            return Enum(OPT_TRY(integer.read(reader)));
+        }
+
     };
+    template<typename Enum>
+    constexpr auto enumerated() {
+        return type<Encoding::Primitive, 0x0a>(Enumerated<Enum>());
+    }
 
-    template<> struct UniversalElement<Null> : Element {
-    public:
-        static constexpr HeaderTagNumber type = Null;
-        explicit UniversalElement(const string_view raw) : Element(raw, ParseType::Checked) {
-            auto data_size = this->length->get_data_size();
-            if (data_size > 0) goto set_as_invalid;
-            this->state = Valid;
-            return;
+    template<typename ... Types>
+    struct Sequence {
 
-            set_as_invalid:
-            this->state = ParsedInvalid;
+        std::tuple<Types...> types;
+        explicit constexpr Sequence(auto&&... types):
+            types(FWD(types)...) {}
+
+        auto operator()(auto&&... args) const {
+            static_assert(sizeof...(Types) == sizeof...(args));
+            return std::tuple(FWD(args)...);
         }
 
-        explicit UniversalElement() : Element(HeaderTagNumber::Null, HeaderTagClass::Universal, 1) {
-            this->state = Valid;
+        void write(auto& writer, auto const& elements) const {
+            auto indices = std::make_index_sequence<sizeof...(Types)>{};
+            write_elements(writer, elements, indices);
         }
-    };
-    typedef UniversalElement<Null> UniversalNull;
-
-    template<> struct UniversalElement<Boolean> : Element {
-    public:
-        static constexpr HeaderTagNumber type = Boolean;
-    private:
-        bool value = false;
-    public:
-        explicit UniversalElement(const string_view raw) : Element(raw, ParseType::Checked) {
-            auto data_size = this->length->get_data_size();
-            if (data_size > sizeof(this->value)) goto set_as_invalid;
-            this->value = !!*this->get_data_ptr<uint8_t>();
-            this->state = Valid;
-            return;
-
-            set_as_invalid:
-            this->state = ParsedInvalid;
+        template<size_t ... indices>
+        void write_elements(auto& writer, auto const& elements, std::index_sequence<indices...>) const {
+            (std::get<indices>(types)(std::get<indices>(elements)).write(writer), ...);
         }
 
-        explicit UniversalElement(const bool value) : Element(HeaderTagNumber::Boolean, HeaderTagClass::Universal, 1) {
-            *this->get_data_ptr<uint8_t>() = (uint8_t) !!value;
-            this->value = value;
-            this->state = Valid;
+        auto read(auto& reader) const {
+            return read_elements<0>(reader);
         }
-
-        constexpr const bool get_value() const {
-            return value;
-        }
-    };
-    typedef UniversalElement<Boolean> UniversalBoolean;
-
-    template<> struct UniversalElement<Integer> : Element {
-    public:
-        static constexpr HeaderTagNumber type = Integer;
-    private:
-        int32_t value = 0;
-        bool compute_value() {
-            const auto data_size = this->length->get_data_size();
-            if (data_size > sizeof(this->value)) return false;
-
-            const int8_t first_byte = *this->get_data_ptr<int8_t>();
-            // We are dealing with a positive number
-            if(first_byte >= 0) {
-                for (size_t i = 0; i < data_size; i++) {
-                    this->value += this->get_data_ptr<uint8_t>()[i] << (8 * (data_size - i - 1));
+        template<size_t i>
+        auto read_elements(auto& reader, auto&&... values) const {
+            if constexpr (i < sizeof...(Types)) {
+                auto value = std::get<i>(types).read(reader);
+                if (!value) {
+                    return decltype(read_elements<i + 1>(reader, FWD(values)..., FWD(*value))){};
                 }
+                return read_elements<i + 1>(reader, FWD(values)..., FWD(*value));
+            } else {
+                return std::optional(std::tuple(FWD(values)...));
             }
-            // We are dealing with a negative number
-            else {
-                uint32_t unsigned_value = 0;
-                for(size_t i = 0; i < data_size; i++) {
-                    unsigned_value += this->get_data_ptr<uint8_t>()[i] << (8*(sizeof(this->value)-i-1));
-                }
-                this->value = ((int32_t)unsigned_value >> (8 * (sizeof(this->value) - data_size)));
+        }
+
+    };
+    constexpr auto sequence(auto&&... elements) {
+        return type<Encoding::Constructed, 0x10>(Sequence<std::decay_t<decltype(elements)>...>(FWD(elements)...));
+    }
+
+    template<typename Type>
+    struct SequenceOf {
+
+        Type type;
+        explicit constexpr SequenceOf(auto&& type):
+            type(FWD(type)) {}
+
+        auto operator()(auto&&... args) const {
+            return std::tuple(FWD(args)...);
+        }
+
+        void write(auto& writer, auto const& elements) const {
+            write_elements<0>(writer, elements);
+        }
+        template<size_t i>
+        void write_elements(auto& writer, auto const& elements) const {
+            if constexpr (i < std::tuple_size<std::decay_t<decltype(elements)>>()) {
+                type(std::get<i>(elements)).write(writer);
+                write_elements<i + 1>(writer, elements);
+            }
+        }
+
+        std::optional<Bytes::StringViewReader> read(auto& reader) const {
+            auto size = reader.size();
+            return Bytes::StringViewReader{OPT_TRY(reader.read(size))};
+        }
+
+    };
+    constexpr auto sequence_of(auto&& type) {
+        return BER::type<Encoding::Constructed, 0x10>(SequenceOf<std::decay_t<decltype(type)>>(FWD(type)));
+    }
+    constexpr auto set_of(auto&& type) {
+        return BER::type<Encoding::Constructed, 0x11>(SequenceOf<std::decay_t<decltype(type)>>(FWD(type)));
+    }
+
+    template<typename Type>
+    struct Optional {
+
+        Type type;
+        explicit constexpr Optional(auto&& type):
+            type(FWD(type)) {}
+
+        constexpr auto operator()(auto&& value) const {
+            return BER::Writable(*this, FWD(value));
+        }
+
+        void write(auto& writer, std::nullopt_t) const {
+            // write nothing
+        }
+        void write(auto& writer, auto&& value) const {
+            type(FWD(value)).write(writer);
+        }
+        template<typename Value>
+        void write(auto& writer, std::optional<Value> const& value) const {
+            if (value) {
+                type(*value).write(writer);
+            }
+        }
+
+        auto read(auto& reader) const {
+            auto state = reader;
+            auto result = type.read(reader);
+            if (!result) {
+                // put back consumed bytes
+                reader = FWD(state);
+            }
+            return std::optional<decltype(result)>(FWD(result));
+        }
+
+    };
+    constexpr auto optional(auto&& type) {
+        return Optional<std::decay_t<decltype(type)>>(FWD(type));
+    }
+
+    template<typename TagNumber, typename Types, TagNumber ... tag_numbers>
+    struct Choice {
+
+        Types types;
+        explicit constexpr Choice(Types types): types(FWD(types)) {}
+
+        constexpr auto with(auto&& type) {
+            constexpr auto tag_number = decltype(type.identifier)::dynamic.tag_number;
+            auto types = std::tuple_cat(this->types, std::tuple(type));
+            return Choice<TagNumber, decltype(types), tag_numbers..., tag_number>(std::move(types));
+        }
+
+        template<TagNumber tag_number>
+        constexpr auto with(auto&& type) {
+            static_assert(decltype(type.identifier)::dynamic.tag_class == TagClass::Universal);
+            return with(type.template context_specific<tag_number>());
+        }
+
+        static constexpr auto tag_number(size_t i) {
+            return std::array{tag_numbers...}[i];
+        }
+
+        template<TagNumber tag_number, size_t i = 0>
+        static constexpr auto index_of() {
+            static_assert(i < sizeof...(tag_numbers), "tag number not found among choices");
+            if constexpr (tag_number == Choice::tag_number(i)) {
+                return i;
+            } else if constexpr (i < sizeof...(tag_numbers)) {
+                return index_of<tag_number, i + 1>();
+            }
+        }
+
+        template<TagNumber tag_number>
+        constexpr auto&& type() const {
+            return std::get<index_of<tag_number>()>(types);
+        }
+
+        template<TagNumber tag_number>
+        constexpr auto make(auto&&... args) const {
+            return type<tag_number>()(FWD(args)...);
+        }
+
+        constexpr auto operator()(auto&& value) const {
+            return FWD(value);
+        }
+
+        template<typename ... Values>
+        struct Read {
+            using Variant = typename std::variant<Values...>;
+            TagNumber tag_number;
+            Variant value;
+
+            template<size_t i>
+            static auto indexed(auto&& value) {
+                return Read{Choice::tag_number(i), Variant(std::in_place_index_t<i>(), FWD(value))};
             }
 
-            return true;
-        }
-        constexpr uint8_t get_length_from_value(int32_t value) {
-           return (
-                   (value < -(1<<23) | value >= (1<<23)) ? 4 :
-                   (value < -(1<<15) | value >= (1<<15)) ? 3 :
-                   (value < -(1<< 7) | value >= (1<< 7)) ? 2 :
-                                                           1
-           );
-        }
+            bool operator==(Read const& that) const {
+                return this->tag_number == that.tag_number && this->value == that.value;
+            }
 
-    public:
-        explicit UniversalElement(const string_view raw) : Element(raw) {
-           if(this->compute_value()) {
-              this->state = Valid;
-              return;
-           }
-
-           set_as_invalid:
-           this->state = ParsedInvalid;
-        }
-
-        explicit UniversalElement(const int32_t value) : Element(HeaderTagNumber::Integer, HeaderTagClass::Universal, get_length_from_value(value)) {
-            if (value >= 0) {
-                auto data_ptr = this->get_data_ptr<uint8_t>();
-                for (uint8_t i = 0; i < this->length->length; i++) {
-                    data_ptr[this->length->length - i -1] = (value >> (8*i)) & 0xff;
+            template<TagNumber tag_number>
+            auto&& get() const {
+                return std::get<index_of<tag_number>()>(value);
+            }
+        };
+        template<size_t i, typename ... Values>
+        auto read_choices(auto& reader, auto&& identifier) const {
+            if constexpr (i < sizeof...(tag_numbers)) {
+                auto& type = std::get<i>(types);
+                using Value = std::decay_t<decltype(*type.read(reader))>;
+                using Result = decltype(read_choices<i + 1, Values..., Value>(reader, identifier));
+                using Read = typename Result::value_type;
+                if (type.identifier == identifier) {
+                    auto&& result = type.serde.read(reader);
+                    if (!result) {
+                        return Result(std::nullopt);
+                    }
+                    return Result(Read::template indexed<i>(*FWD(result)));
+                } else {
+                    return read_choices<i + 1, Values..., Value>(reader, FWD(identifier));
                 }
             } else {
-                auto data_ptr = this->get_data_ptr<uint8_t>();
-                const auto n_bytes = this->length->length;
-                for(int i = 0; i < n_bytes; i++) {
-                    data_ptr[i] = (value >> (8*(n_bytes-i-1))) & 0xff;
-                }
+                return std::optional<Read<Values...>>(std::nullopt);
             }
-            this->value = value;
-            this->state = Valid;
+        }
+        auto read(auto& reader) const -> decltype(read_choices<0>(reader, *DynamicIdentifier<TagNumber>::read(std::declval<Bytes::StringViewReader&>()))) {
+            auto&& identifier = OPT_TRY(DynamicIdentifier<TagNumber>::read(reader));
+
+            auto length = OPT_TRY(Length::read(reader));
+            OPT_REQUIRE(!length.is_indefinite());
+
+            auto bytes = Bytes::StringViewReader{OPT_TRY(reader.read(*length.length))};
+            return read_choices<0>(bytes, FWD(identifier));
         }
 
-        constexpr const int32_t get_value() const {
-            return value;
-        }
     };
-    typedef UniversalElement<Integer> UniversalInteger;
+    template<typename TagNumber = int>
+    constexpr auto choice() {
+        auto types = std::tuple();
+        return Choice<TagNumber, decltype(types)>(std::move(types));
+    }
 
-
-    // TODO: support constructed strings
-//    template<> struct UniversalElement<OctetString> : Element {
-//    protected:
-//        static constexpr HeaderTagNumber type = OctetString;
-//    public:
-//        explicit UniversalElement(const string_view raw) : Element(raw, ParseType::Checked) {
-//           auto data_size = this->length->get_data_size();
-//           if (data_size > sizeof(this->value)) goto set_as_invalid;
-//           this->value = !!*this->get_data_ptr<uint8_t>();
-//           this->state = Valid;
-//           return;
-//
-//           set_as_invalid:
-//           this->state = ParsedInvalid;
-//        }
-//
-//        explicit UniversalElement(const string value) : Element(HeaderTagNumber::Boolean, HeaderTagClass::Universal, 1) {
-//           *this->get_data_ptr<uint8_t>() = (uint8_t) !!value;
-//           this->value = value;
-//           this->state = Valid;
-//        }
-//
-//        constexpr const bool get_value() const {
-//           return value;
-//        }
-
-
-
-//        explicit UniversalElement(const string_view raw) : Element(raw) {}
-//        static unique_ptr<BER::UniversalElement<OctetString>> parse(string_view raw)
-//        {
-//            auto universal_element = unique_ptr<UniversalElement>(new UniversalElement(raw));
-//            auto element = static_unique_pointer_cast<BER::UniversalElement<OctetString>>(Element::parse(move(universal_element), raw));
-////            auto element = static_pointer_cast<BER::UniversalElement<OctetString>>(Element::parse(move(universal_element), raw));
-//            if (element == nullptr) return nullptr;
-//            return element;
-//        }
-//        constexpr const string_view get_value() const {
-//            return extra_data;
-//        }
-//    };
-//    template<> struct UniversalElement<IA5String> : UniversalElement<OctetString> {
-//    public:
-//        static constexpr HeaderTagNumber type = IA5String;
-//    };
-//    template<> struct UniversalElement<PrintableString> : UniversalElement<OctetString> {
-//    public:
-//        static constexpr HeaderTagNumber type = PrintableString;
-//    };
-//    template<> struct UniversalElement<T61String> : UniversalElement<OctetString> {
-//    public:
-//        static constexpr HeaderTagNumber type = T61String;
-//    };
-//    typedef UniversalElement<OctetString> UniversalOctetString;
-//    typedef UniversalElement<IA5String> UniversalIA5String;
-//    typedef UniversalElement<PrintableString> UniversalPrintableString;
-//    typedef UniversalElement<T61String> UniversalT61String;
-
-//    template<> struct UniversalElement<Sequence> : Element {
-//    public:
-//        static constexpr HeaderTagNumber type = Sequence;
-//    private:
-//        vector<shared_ptr<Element>> value;
-//
-//    public:
-//        explicit UniversalElement(const string_view raw) : Element(raw) {}
-//
-//    private:
-//        template <HeaderTagNumber N, typename T=UniversalElement<N>>
-//        unique_ptr<T> make_shared_element(const char* data) {
-//            return unique_ptr<T>(T::parse(static_cast<const char *>((void*)data)));
-//        }
-//
-//        bool compute_value() {
-//            auto data_size = this->length->get_data_size();
-//
-//            size_t offset = 0;
-//            while(offset < data_size) {
-//                auto data = string_view(this->get_data_ptr<const char>(offset));
-//                auto header_tag = BER::HeaderTag::parse(data);
-//
-//                // TODO: use a proper factory?
-//                unique_ptr<Element> downgraded_element = nullptr;
-//                switch(header_tag->number) {
-//                    #define BER_PARSE_TYPE(type) \
-//                        case type: { \
-//                            auto universal_element = UniversalElement<type>::parse(static_cast<const char *>((void*)data.data())); \
-//                            downgraded_element = static_unique_pointer_cast<BER::Element>(Element::parse(move(universal_element), data.data())); \
-//                        } break;
-//                    BER_PARSE_TYPE(Boolean)
-//                    BER_PARSE_TYPE(Integer)
-//                    BER_PARSE_TYPE(BitString)
-//                    BER_PARSE_TYPE(OctetString)
-//                    BER_PARSE_TYPE(Null)
-//                    BER_PARSE_TYPE(ObjectIdentifier)
-//                    BER_PARSE_TYPE(Sequence)
-//                    BER_PARSE_TYPE(Set)
-//                    BER_PARSE_TYPE(PrintableString)
-//                    BER_PARSE_TYPE(T61String)
-//                    BER_PARSE_TYPE(IA5String)
-//                    BER_PARSE_TYPE(UTCTime)
-//                    BER_PARSE_TYPE(ExtendedType)
-//                }
-//                if (downgraded_element == nullptr) {
-//                    for(auto& cur_element: this->value) {
-//                        cur_element.reset();
-//                    }
-//                    return false;
-//                }
-//
-//                offset += downgraded_element->get_size();
-//                this->value.push_back(move(downgraded_element));
-//            }
-//            return true;
-//        }
-//    public:
-//        static unique_ptr<BER::UniversalElement<Sequence>> parse(string_view raw)
-//        {
-//            auto universal_element = unique_ptr<UniversalElement>(new UniversalElement(raw));
-//            auto element = static_unique_pointer_cast<BER::UniversalElement<Sequence>>(Element::parse(move(universal_element), raw));
-//            if (element == nullptr) return nullptr;
-//            bool success = element->compute_value();
-//            if (!success) {
-//                return nullptr;
-//            }
-//            return element;
-//        }
-//        constexpr vector<shared_ptr<Element>>* get_value_ptr() {
-//            return &this->value;
-//        }
-//        shared_ptr<Element> elem_at(size_t i) {
-//            if(i >= this->value.size()) return nullptr;
-//            return this->value[i];
-//        }
-//        template <typename T>
-//        shared_ptr<T> casted_elem_at(size_t i) {
-//            if(i >= this->value.size()) return nullptr;
-//            if (T::type != this->value[i]->tag->number) return nullptr;
-//            return static_pointer_cast<T>(this->value[i]);
-//        }
-//    };
-//    typedef UniversalElement<Integer> UniversalInteger;
 }
