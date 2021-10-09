@@ -3,6 +3,10 @@ Arduino code running on an ESP8266 that opens the door lock in the PTL, using LD
 
 ## Build steps
 
+Get the `ptldap` library:
+
+    git submodule update --init
+
 ### With `Arduino IDE`
 
 Install the following libraries:

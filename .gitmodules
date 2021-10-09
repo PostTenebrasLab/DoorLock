@@ -1,0 +1,3 @@
+[submodule "ptldap"]
+	path = ptldap
+	url = https://github.com/PostTenebrasLab/ptldap.git
